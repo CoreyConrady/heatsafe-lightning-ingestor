@@ -16,3 +16,5 @@ Required production environment variable:
 Railway should use the included Dockerfile, `/health` as the healthcheck, and run continuously.
 
 HeatSafe Base44 must be configured with the Railway HTTPS URL and the same shared secret. Safety rule: **unknown is not clear**.
+
+Deployment source is connected to Railway production.
