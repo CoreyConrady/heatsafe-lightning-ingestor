@@ -1,5 +1,6 @@
 import os
 import math
+import json
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -18,13 +19,19 @@ MAX_BBOX_SPAN_DEG = float(os.environ.get("MAX_BBOX_SPAN_DEG", "20"))
 LATEST_GRACE_SECONDS = int(os.environ.get("LATEST_GRACE_SECONDS", "120"))
 MAX_COVERAGE_GAP_SECONDS = int(os.environ.get("MAX_COVERAGE_GAP_SECONDS", "45"))
 
-app = FastAPI(title="HeatSafe Oklahoma Lightning Ingestor", version="1.0.0")
+app = FastAPI(title="HeatSafe Oklahoma Lightning Ingestor", version="1.0.1")
 _fs = s3fs.S3FileSystem(anon=True)
 _fs_lock = threading.Lock()
 
 
 def utcnow():
     return datetime.now(timezone.utc)
+
+
+def log_diag(event: str, **fields):
+    """Emit one-line structured operational diagnostics without secrets."""
+    payload = {"event": event, **fields}
+    print(json.dumps(payload, separators=(",", ":"), default=str), flush=True)
 
 
 def check_key(x_api_key: str = Header(default="")):
@@ -88,8 +95,8 @@ def list_glm_files(since_dt: datetime, now_dt: datetime):
         try:
             with _fs_lock:
                 files.extend(_fs.ls(_hour_prefix(cur)))
-        except Exception:
-            pass
+        except Exception as exc:
+            log_diag("s3_list_error", prefix=_hour_prefix(cur), error=str(exc)[:240])
         cur += timedelta(hours=1)
 
     selected = []
@@ -260,6 +267,30 @@ def lightning(bbox: str = Query(...), since: str = Query(...), source: str = Que
     dedup = {fl["id"]: fl for fl in flashes}
     uniq = sorted(dedup.values(), key=lambda f: f["time"])
     status = "ok" if coverage_complete else "degraded"
+
+    expected_end = now_dt - timedelta(seconds=LATEST_GRACE_SECONDS)
+    latest_age_seconds = round((now_dt - actual_end).total_seconds(), 1) if actual_end else None
+    log_diag(
+        "lightning_request",
+        source="goes19_glm_l2_lcfa",
+        requested_since=since,
+        effective_since=since_dt.isoformat().replace("+00:00", "Z"),
+        bbox=[round(v, 5) for v in parsed_bbox],
+        file_count=len(files),
+        file_error_count=len(file_errors),
+        sample_file_errors=file_errors[:3],
+        flash_count=len(uniq),
+        coverage_complete=bool(coverage_complete),
+        coverage_gap_seconds=int(coverage_gap_seconds),
+        actual_data_window_start=actual_start.isoformat().replace("+00:00", "Z") if actual_start else None,
+        actual_data_window_end=actual_end.isoformat().replace("+00:00", "Z") if actual_end else None,
+        expected_latest_end=expected_end.isoformat().replace("+00:00", "Z"),
+        latest_product_age_seconds=latest_age_seconds,
+        latest_grace_seconds=LATEST_GRACE_SECONDS,
+        max_coverage_gap_seconds=MAX_COVERAGE_GAP_SECONDS,
+        status=status,
+    )
+
     return {
         "ok": True,
         "source": "goes19_glm_l2_lcfa",
