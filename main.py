@@ -19,7 +19,7 @@ MAX_BBOX_SPAN_DEG = float(os.environ.get("MAX_BBOX_SPAN_DEG", "20"))
 LATEST_GRACE_SECONDS = int(os.environ.get("LATEST_GRACE_SECONDS", "120"))
 MAX_COVERAGE_GAP_SECONDS = int(os.environ.get("MAX_COVERAGE_GAP_SECONDS", "45"))
 
-app = FastAPI(title="HeatSafe Oklahoma Lightning Ingestor", version="1.0.1")
+app = FastAPI(title="HeatSafe Oklahoma Lightning Ingestor", version="1.0.2")
 _fs = s3fs.S3FileSystem(anon=True)
 _fs_lock = threading.Lock()
 
@@ -111,24 +111,43 @@ def list_glm_files(since_dt: datetime, now_dt: datetime):
 
 
 def coverage_for_files(files, since_dt, now_dt):
+    """Assess GLM continuity using product cadence, not summed filename-window gaps.
+
+    GOES GLM LCFA products arrive on a regular cadence. The filename start/end
+    windows are not guaranteed to touch exactly, so summing every tiny boundary
+    gap falsely reports a long outage. We instead fail coverage only when there
+    is a materially large leading, inter-product, or trailing gap.
+    """
     if not files:
         return False, int((now_dt - since_dt).total_seconds()), None, None
+
     expected_end = now_dt - timedelta(seconds=LATEST_GRACE_SECONDS)
-    cursor = since_dt
-    total_gap = 0.0
     first_start = files[0][1]
     last_end = files[-1][2]
-    for _, start, end in files:
-        if end < since_dt:
-            continue
-        if start > cursor:
-            total_gap += (start - cursor).total_seconds()
-        if end > cursor:
-            cursor = end
-    if cursor < expected_end:
-        total_gap += (expected_end - cursor).total_seconds()
-    coverage_complete = total_gap <= MAX_COVERAGE_GAP_SECONDS and last_end >= expected_end
-    return coverage_complete, max(0, int(round(total_gap))), first_start, last_end
+
+    # Leading gap matters only when the first available product starts after the
+    # requested window. A product that begins before `since` already covers the
+    # beginning of the request window.
+    leading_gap = max(0.0, (first_start - since_dt).total_seconds())
+
+    # GLM LCFA files are cadence products. Use start-to-start spacing to detect
+    # missing products instead of adding the normal small gap between each
+    # filename's end and the next filename's start.
+    max_internal_gap = 0.0
+    previous_start = None
+    for _path, start, _end in files:
+        if previous_start is not None:
+            spacing = (start - previous_start).total_seconds()
+            if spacing > max_internal_gap:
+                max_internal_gap = spacing
+        previous_start = start
+
+    # A fresh latest product should reach at least the allowed grace boundary.
+    trailing_gap = max(0.0, (expected_end - last_end).total_seconds())
+
+    worst_gap = max(leading_gap, max_internal_gap, trailing_gap)
+    coverage_complete = worst_gap <= MAX_COVERAGE_GAP_SECONDS and last_end >= expected_end
+    return coverage_complete, max(0, int(round(worst_gap))), first_start, last_end
 
 
 def _to_scalar(v):
