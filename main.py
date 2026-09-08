@@ -158,8 +158,8 @@ def _read_var(ds, *names):
 def read_flashes(path: str, file_start: datetime, bbox):
     min_lat, min_lon, max_lat, max_lon = bbox
     with _fs_lock:
-        mapper = s3fs.S3Map(path, s3=_fs, check=False)
-    ds = xr.open_dataset(mapper, engine="h5netcdf", decode_times=True, mask_and_scale=True)
+        file_obj = _fs.open(path, "rb")
+    ds = xr.open_dataset(file_obj, engine="h5netcdf", decode_times=True, mask_and_scale=True)
     try:
         lat = _read_var(ds, "flash_lat")
         lon = _read_var(ds, "flash_lon")
@@ -219,6 +219,10 @@ def read_flashes(path: str, file_start: datetime, bbox):
         return out
     finally:
         ds.close()
+        try:
+            file_obj.close()
+        except Exception:
+            pass
 
 
 @app.get("/lightning")
