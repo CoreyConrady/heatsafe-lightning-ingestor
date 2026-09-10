@@ -19,7 +19,7 @@ MAX_BBOX_SPAN_DEG = float(os.environ.get("MAX_BBOX_SPAN_DEG", "20"))
 LATEST_GRACE_SECONDS = int(os.environ.get("LATEST_GRACE_SECONDS", "120"))
 MAX_COVERAGE_GAP_SECONDS = int(os.environ.get("MAX_COVERAGE_GAP_SECONDS", "45"))
 
-app = FastAPI(title="HeatSafe Oklahoma Lightning Ingestor", version="1.0.2")
+app = FastAPI(title="HeatSafe Oklahoma Lightning Ingestor", version="1.0.3")
 _fs = s3fs.S3FileSystem(anon=True)
 _fs_lock = threading.Lock()
 
@@ -92,11 +92,16 @@ def list_glm_files(since_dt: datetime, now_dt: datetime):
     cur = since_dt.replace(minute=0, second=0, microsecond=0)
     last_hour = now_dt.replace(minute=0, second=0, microsecond=0)
     while cur <= last_hour:
+        prefix = _hour_prefix(cur)
         try:
             with _fs_lock:
-                files.extend(_fs.ls(_hour_prefix(cur)))
+                # s3fs caches directory listings. GLM publishes new objects every
+                # ~20 seconds, so a cached current-hour listing can look like a
+                # growing outage even while NOAA is publishing normally.
+                _fs.invalidate_cache(prefix)
+                files.extend(_fs.ls(prefix, refresh=True))
         except Exception as exc:
-            log_diag("s3_list_error", prefix=_hour_prefix(cur), error=str(exc)[:240])
+            log_diag("s3_list_error", prefix=prefix, error=str(exc)[:240])
         cur += timedelta(hours=1)
 
     selected = []
@@ -125,14 +130,8 @@ def coverage_for_files(files, since_dt, now_dt):
     first_start = files[0][1]
     last_end = files[-1][2]
 
-    # Leading gap matters only when the first available product starts after the
-    # requested window. A product that begins before `since` already covers the
-    # beginning of the request window.
     leading_gap = max(0.0, (first_start - since_dt).total_seconds())
 
-    # GLM LCFA files are cadence products. Use start-to-start spacing to detect
-    # missing products instead of adding the normal small gap between each
-    # filename's end and the next filename's start.
     max_internal_gap = 0.0
     previous_start = None
     for _path, start, _end in files:
@@ -142,7 +141,6 @@ def coverage_for_files(files, since_dt, now_dt):
                 max_internal_gap = spacing
         previous_start = start
 
-    # A fresh latest product should reach at least the allowed grace boundary.
     trailing_gap = max(0.0, (expected_end - last_end).total_seconds())
 
     worst_gap = max(leading_gap, max_internal_gap, trailing_gap)
